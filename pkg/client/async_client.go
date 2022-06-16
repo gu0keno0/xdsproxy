@@ -2,6 +2,7 @@ package client
 
 import (
 	"errors"
+	"log"
 	"sync"
 	"time"
 
@@ -10,7 +11,8 @@ import (
 
 // AsyncClientCallback is the client side callback function for handling Incremental ADS responses.
 type AsyncClientCallback interface {
-	HandleADS(client *AsyncClient, resp *envoy_service_discovery_v3.DeltaDiscoveryResponse) error
+	GetInitialAdsRequest() *envoy_service_discovery_v3.DeltaDiscoveryRequest
+	HandleAds(client *AsyncClient, resp *envoy_service_discovery_v3.DeltaDiscoveryResponse) error
 }
 
 type resourceState struct {
@@ -36,21 +38,15 @@ type AsyncClient struct {
 	stopChan chan struct{}
 }
 
-func NewAsyncClient(config *AdsClientConfig, cb AsyncClientCallback) (*AsyncClient, error) {
-	asc := &AsyncClient{
+func NewAsyncClient(config *AdsClientConfig, cb AsyncClientCallback) *AsyncClient {
+	return &AsyncClient{
+		adsc:     NewAdsDeltaStreamClient(config),
 		config:   config,
 		callback: cb,
 		adsState: map[string]aggResourceState{},
 		reqChan:  make(chan *envoy_service_discovery_v3.DeltaDiscoveryRequest, config.MaxPendingRequests),
 		stopChan: make(chan struct{}),
 	}
-
-	adsc, err := NewAdsDeltaStreamClient(asc.config)
-	if err != nil {
-		return nil, err
-	}
-	asc.adsc = adsc
-	return asc, nil
 }
 
 func (asc *AsyncClient) getAdsClient() *AdsDeltaStreamClient {
@@ -63,6 +59,12 @@ func (asc *AsyncClient) getRequestChan() chan *envoy_service_discovery_v3.DeltaD
 	asc.mutex.Lock()
 	defer asc.mutex.Unlock()
 	return asc.reqChan
+}
+
+func (asc *AsyncClient) sendInitialRequest() error {
+	initialRequest := asc.callback.GetInitialAdsRequest()
+	log.Printf("Sending initial ADS request: %v\n", initialRequest)
+	return asc.Send(initialRequest)
 }
 
 func (asc *AsyncClient) requestsLoop() {
@@ -80,7 +82,12 @@ func (asc *AsyncClient) requestsLoop() {
 			if adsc == nil {
 				break
 			}
-			adsc.Send(req)
+			log.Printf("Sending ADS request: %v\n", req)
+			if err := adsc.Send(req); err != nil {
+				// TODO(gu0keno0): implement retry and timeout
+				// TODO(guokeno0): keep retrying for initial request.
+				log.Printf("Failed to send ADS request")
+			}
 		}
 	}
 }
@@ -92,18 +99,22 @@ func (asc *AsyncClient) responsesLoop() {
 			break
 		}
 		resp, err := adsc.Recv()
+		log.Printf("Received resp=%v err=%v\n", resp, err)
 		if err != nil {
 			time.Sleep(asc.config.RecvErrBackoffInterval)
 			continue
 		}
 		ack := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
-			Node:                     asc.config.Node(),
-			TypeUrl:                  resp.TypeUrl,
-			ResponseNonce:            resp.Nonce,
+			Node:          asc.config.Node(),
+			TypeUrl:       resp.TypeUrl,
+			ResponseNonce: resp.Nonce,
 		}
 		// TODO (gu0keno0): implement / rule out the cases for sending NACKs.
 		asc.Send(ack)
-		asc.callback.HandleADS(asc, resp)
+		// TODO (gu0keno0): handle errors returned by ADS protocol handler.
+		if err = asc.callback.HandleAds(asc, resp); err != nil {
+			log.Printf("Failed to handle ADS response: %v", err)
+		}
 	}
 }
 
@@ -124,6 +135,7 @@ func (asc *AsyncClient) Send(req *envoy_service_discovery_v3.DeltaDiscoveryReque
 }
 
 func (asc *AsyncClient) Run() {
+	asc.sendInitialRequest()
 	go asc.requestsLoop()
 	go asc.responsesLoop()
 }
@@ -142,6 +154,7 @@ func (asc *AsyncClient) Stop() {
 	}
 
 	if adsc != nil {
-		adsc.Close()
+		adsc.Disconnect()
 	}
+	// TODO(gu0keno0): join the req / resp goroutine loops.
 }
