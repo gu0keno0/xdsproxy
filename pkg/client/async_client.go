@@ -109,8 +109,9 @@ func (asc *AsyncClient) responsesLoop() {
 			TypeUrl:       resp.TypeUrl,
 			ResponseNonce: resp.Nonce,
 		}
-		// TODO (gu0keno0): implement / rule out the cases for sending NACKs.
+		// TODO (gu0keno0): Debug Istio error "ADS:LDS: New ACK and old ACK check mismatch: false vs true".
 		asc.Send(ack)
+
 		// TODO (gu0keno0): handle errors returned by ADS protocol handler.
 		if err = asc.callback.HandleAds(asc, resp); err != nil {
 			log.Printf("Failed to handle ADS response: %v", err)

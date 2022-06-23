@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 
 	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -11,18 +13,29 @@ import (
 	envoy_config_listener_v3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoy_extensions_filters_network_http_connection_manager_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	clusterservice "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
+	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	envoy_service_discovery_v3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	endpointservice "github.com/envoyproxy/go-control-plane/envoy/service/endpoint/v3"
+	listenerservice "github.com/envoyproxy/go-control-plane/envoy/service/listener/v3"
+	routeservice "github.com/envoyproxy/go-control-plane/envoy/service/route/v3"
+	runtimeservice "github.com/envoyproxy/go-control-plane/envoy/service/runtime/v3"
+	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	xds_resource "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"github.com/golang/protobuf/ptypes"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+	"xdsproxy/pkg/cache"
 	"xdsproxy/pkg/client"
 )
 
 const (
-	GLOBAL_LDS_CONFIG_NAME   = "0.0.0.0_18080"
-	GLOBAL_LISTNER_NAME      = "0.0.0.0_18080"
+	GLOBAL_LDS_CONFIG_NAME          = "0.0.0.0_18080"
+	GLOBAL_LISTNER_NAME             = "0.0.0.0_18080"
 	GLOBAL_VIRTUAL_HOST_NAME_SUFFIX = ":18080"
-	CLUSTER_NAME_SUFFIX = ".com"
+	CLUSTER_NAME_SUFFIX             = ".com"
 )
 
 // XdsProxy implements a xDS proxy for upstream Istio cluster with caching
@@ -32,6 +45,8 @@ const (
 type XdsProxy struct {
 	config         *ProxyConfig
 	adsAsyncClient *client.AsyncClient
+	cache          *cache.XdsCache
+	proxyServer    server.Server
 }
 
 func NewXdsProxy(config *ProxyConfig) *XdsProxy {
@@ -39,8 +54,49 @@ func NewXdsProxy(config *ProxyConfig) *XdsProxy {
 		config: config,
 	}
 	proxy.adsAsyncClient = client.NewAsyncClient(config.AdsClientConfig, proxy)
+	proxy.cache = cache.NewXdsCache()
+
+	callback := server.CallbackFuncs{
+		StreamRequestFunc:      proxy.OnStreamRequest,
+		StreamDeltaRequestFunc: proxy.OnStreamDeltaRequest,
+	}
+	proxy.proxyServer = server.NewServer(context.Background(), proxy.cache, callback)
 
 	return proxy
+}
+
+func (proxy *XdsProxy) runServer() {
+	var grpcOptions []grpc.ServerOption
+	grpcOptions = append(grpcOptions,
+		grpc.MaxConcurrentStreams(proxy.config.XdsServerConfig.GrpcMaxConcurrentStreams),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    proxy.config.XdsServerConfig.GrpcKeepaliveTime,
+			Timeout: proxy.config.XdsServerConfig.GrpcKeepaliveTimeout,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             proxy.config.XdsServerConfig.GrpcKeepaliveMinTime,
+			PermitWithoutStream: true,
+		}),
+	)
+	grpcServer := grpc.NewServer(grpcOptions...)
+
+	lis, err := net.Listen("tcp", proxy.config.XdsServerConfig.GrpcListenAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	discoverygrpc.RegisterAggregatedDiscoveryServiceServer(grpcServer, proxy.proxyServer)
+	endpointservice.RegisterEndpointDiscoveryServiceServer(grpcServer, proxy.proxyServer)
+	clusterservice.RegisterClusterDiscoveryServiceServer(grpcServer, proxy.proxyServer)
+	routeservice.RegisterRouteDiscoveryServiceServer(grpcServer, proxy.proxyServer)
+	listenerservice.RegisterListenerDiscoveryServiceServer(grpcServer, proxy.proxyServer)
+	secretservice.RegisterSecretDiscoveryServiceServer(grpcServer, proxy.proxyServer)
+	runtimeservice.RegisterRuntimeDiscoveryServiceServer(grpcServer, proxy.proxyServer)
+
+	log.Printf("management server listening on %v\n", proxy.config.XdsServerConfig.GrpcListenAddress)
+	if err = grpcServer.Serve(lis); err != nil {
+		log.Println(err)
+	}
 }
 
 func (proxy *XdsProxy) Run() {
@@ -48,6 +104,10 @@ func (proxy *XdsProxy) Run() {
 	// invoked as responses are streamed back from upstream xDS server, and
 	// we populate local xDS cache there.
 	proxy.adsAsyncClient.Run()
+	// Run xDS server.
+	if proxy.config.XdsServerConfig != nil {
+		proxy.runServer()
+	}
 }
 
 func (proxy *XdsProxy) GetInitialAdsRequest() *envoy_service_discovery_v3.DeltaDiscoveryRequest {
@@ -58,7 +118,36 @@ func (proxy *XdsProxy) GetInitialAdsRequest() *envoy_service_discovery_v3.DeltaD
 		TypeUrl:                xds_resource.ListenerType,
 		ResourceNamesSubscribe: []string{GLOBAL_LDS_CONFIG_NAME},
 	}
+	/*req := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
+	    Node:                   proxy.config.AdsClientConfig.Node(),
+	    TypeUrl:                xds_resource.ClusterType,
+	    ResourceNamesSubscribe: []string{"*"},
+	}*/
 	return req
+}
+
+func (proxy *XdsProxy) OnStreamRequest(streamID int64, req *discoverygrpc.DiscoveryRequest) error {
+	deltaReq := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
+		Node:                   proxy.config.AdsClientConfig.Node(),
+		TypeUrl:                req.TypeUrl,
+		ResourceNamesSubscribe: req.ResourceNames,
+	}
+	// TODO(gu0keno0): handle ratelimit errors.
+	return proxy.adsAsyncClient.Send(deltaReq)
+}
+
+func (proxy *XdsProxy) OnStreamDeltaRequest(streamID int64, req *discoverygrpc.DeltaDiscoveryRequest) error {
+	// TODO(gu0keno0): use cache to avoid sending duplicated requests.
+	// TODO(gu0keno0): handle wildcard requests.
+	// TODO(gu0keno0): handle initial request version comparisons.
+	deltaReq := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
+		Node:                     proxy.config.AdsClientConfig.Node(),
+		TypeUrl:                  req.TypeUrl,
+		ResourceNamesSubscribe:   req.ResourceNamesSubscribe,
+		ResourceNamesUnsubscribe: req.ResourceNamesUnsubscribe,
+	}
+	// TODO(gu0keno0): handle ratelimit errors.
+	return proxy.adsAsyncClient.Send(deltaReq)
 }
 
 func (proxy *XdsProxy) handleLds(resp *envoy_service_discovery_v3.DeltaDiscoveryResponse) error {
@@ -69,7 +158,8 @@ func (proxy *XdsProxy) handleLds(resp *envoy_service_discovery_v3.DeltaDiscovery
 			return err
 		}
 
-		// TODO(gu0keno0): populate LDS cache. Version is in Resource object.
+		// TODO(gu0keno0): use resource version to avoid duplicated LDS updates.
+		proxy.cache.SetResource(xds_resource.ListenerType, listener.Name, listener)
 		if listener.Name == GLOBAL_LISTNER_NAME {
 			log.Printf("Got global listener: %v", listener)
 			rds_config_names := []string{}
@@ -110,13 +200,14 @@ func (proxy *XdsProxy) handleRds(resp *envoy_service_discovery_v3.DeltaDiscovery
 			return err
 		}
 		log.Printf("Got route_config: %v", route_config)
+		// TODO(gu0keno0): use resource version to avoid duplicated RDS updates.
+		proxy.cache.SetResource(xds_resource.RouteType, route_config.Name, route_config)
 		for _, vh := range route_config.VirtualHosts {
 			if !strings.HasSuffix(vh.Name, GLOBAL_VIRTUAL_HOST_NAME_SUFFIX) {
 				continue
 			}
 			clusters := make(map[string]bool)
 			log.Printf("Got global virtual host: %v", vh)
-			// TODO(gu0keno0): cache RDS
 			for _, route := range vh.Routes {
 				log.Printf("Got route %v (under %v): %v", route.Name, vh.Name, route)
 				route_action_wrapper, ok := route.Action.(*envoy_config_route_v3.Route_Route)
@@ -156,7 +247,8 @@ func (proxy *XdsProxy) handleCds(resp *envoy_service_discovery_v3.DeltaDiscovery
 		// TODO(gu0keno0): better filtering of cluster names.
 		if strings.HasPrefix(cluster.Name, "outbound") && !strings.HasPrefix(cluster.Name, "outbound|18080") && strings.HasSuffix(cluster.Name, CLUSTER_NAME_SUFFIX) {
 			log.Printf("Got cluster: %v", cluster)
-			// TODO(gu0keno0): cache clusters.
+			// TODO(gu0keno0): use resource version to avoid duplicated CDS updates.
+			proxy.cache.SetResource(xds_resource.ClusterType, cluster.Name, cluster)
 			eds_config_names := []string{}
 			if cluster_type, ok := cluster.ClusterDiscoveryType.(*envoy_config_cluster_v3.Cluster_Type); ok {
 				if cluster_type.Type == envoy_config_cluster_v3.Cluster_EDS {
@@ -183,8 +275,9 @@ func (proxy *XdsProxy) handleEds(resp *envoy_service_discovery_v3.DeltaDiscovery
 		if err := ptypes.UnmarshalAny(res.Resource, cluster_load_assignment); err != nil {
 			return err
 		}
-		//TODO(gu0keno0): cache for endpoints.
+		//TODO(gu0keno0): use resource version to avoid duplicated EDS updates.
 		log.Printf("Got Cluster Load Assignment: %v\n", cluster_load_assignment)
+		proxy.cache.SetResource(xds_resource.EndpointType, cluster_load_assignment.ClusterName, cluster_load_assignment)
 	}
 	return nil
 }

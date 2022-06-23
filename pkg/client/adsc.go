@@ -2,7 +2,7 @@ package client
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"math"
 	"sync"
 
@@ -80,7 +80,7 @@ func (adsc *AdsDeltaStreamClient) Send(req *envoy_service_discovery_v3.DeltaDisc
 	// TODO(gu0keno0): handle reconnect.
 	client, err := adsc.getClient()
 	if err != nil {
-		return errors.New("cannot get ADS client for sending requests")
+		return fmt.Errorf("cannot get ADS client for sending requests: %v", err)
 	}
 
 	return client.Send(req)
@@ -90,7 +90,7 @@ func (adsc *AdsDeltaStreamClient) Recv() (*envoy_service_discovery_v3.DeltaDisco
 	// TODO(gu0keno0): handle reconnect.
 	client, err := adsc.getClient()
 	if err != nil {
-		return nil, errors.New("cannot get ADS client for receiving responses")
+		return nil, fmt.Errorf("cannot get ADS client for receiving responses: %v", err)
 	}
 
 	return client.Recv()
