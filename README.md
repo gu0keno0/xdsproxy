@@ -2,7 +2,7 @@
 xDS proxy server with a internal cache, used for scaling out xDS control planes such as Istio
 
 To build:
-go build -o ~/tmp ./...
+go get -d -v ./... && go build -o ~/tmp ./...
 
 Run agent in client only mode:
 ~/tmp/xdsproxy-agent -c -u 127.0.0.1:15020 # useful for debugging
