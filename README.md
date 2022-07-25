@@ -9,3 +9,7 @@ Run agent in client only mode:
 
 Run agent in proxy mode:
 ~/tmp/xdsproxy-agent # assume server running at 127.0.0.1:15010
+
+Set initial LDS resource name:
+echo > /tmp/1 ; ~/tmp/xdsproxy-agent -c -u 127.0.0.1:15010 -t "d2-service-envoy-benchmark.prod.linkedin.com_18080" 2>&1 | tee /tmp/1
+echo > /tmp/1 ; ~/tmp/xdsproxy-agent -c -u 127.0.0.1:15010 -t "d2-service-polarisfoo1.prod.linkedin.com_18080,d2-service-envoy-benchmark.prod.linkedin.com_18080" 2>&1 | tee /tmp/1

@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -32,8 +31,7 @@ import (
 )
 
 const (
-	GLOBAL_LDS_CONFIG_NAME          = "0.0.0.0_18080"
-	GLOBAL_LISTNER_NAME             = "0.0.0.0_18080"
+	GLOBAL_LISTNER_NAME_SUFFIX		= "_18080"
 	GLOBAL_VIRTUAL_HOST_NAME_SUFFIX = ":18080"
 	CLUSTER_NAME_SUFFIX             = ".com"
 )
@@ -47,6 +45,10 @@ type XdsProxy struct {
 	adsAsyncClient *client.AsyncClient
 	cache          *cache.XdsCache
 	proxyServer    server.Server
+
+	cdsInitialized bool
+	rdsInitialized bool
+	edsInitialized map[string]struct{}
 }
 
 func NewXdsProxy(config *ProxyConfig) *XdsProxy {
@@ -61,6 +63,8 @@ func NewXdsProxy(config *ProxyConfig) *XdsProxy {
 		StreamDeltaRequestFunc: proxy.OnStreamDeltaRequest,
 	}
 	proxy.proxyServer = server.NewServer(context.Background(), proxy.cache, callback)
+
+	proxy.edsInitialized = make(map[string]struct{})
 
 	return proxy
 }
@@ -116,7 +120,7 @@ func (proxy *XdsProxy) GetInitialAdsRequest() *envoy_service_discovery_v3.DeltaD
 	req := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
 		Node:                   proxy.config.AdsClientConfig.Node(),
 		TypeUrl:                xds_resource.ListenerType,
-		ResourceNamesSubscribe: []string{GLOBAL_LDS_CONFIG_NAME},
+		ResourceNamesSubscribe: proxy.config.InitialListeners,
 	}
 	/*req := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
 	    Node:                   proxy.config.AdsClientConfig.Node(),
@@ -151,6 +155,7 @@ func (proxy *XdsProxy) OnStreamDeltaRequest(streamID int64, req *discoverygrpc.D
 }
 
 func (proxy *XdsProxy) handleLds(resp *envoy_service_discovery_v3.DeltaDiscoveryResponse) error {
+	rds_config_names := []string{}
 	for _, res := range resp.Resources {
 		listener := &envoy_config_listener_v3.Listener{}
 		if err := ptypes.UnmarshalAny(res.Resource, listener); err != nil {
@@ -160,9 +165,15 @@ func (proxy *XdsProxy) handleLds(resp *envoy_service_discovery_v3.DeltaDiscovery
 
 		// TODO(gu0keno0): use resource version to avoid duplicated LDS updates.
 		proxy.cache.SetResource(xds_resource.ListenerType, listener.Name, listener)
-		if listener.Name == GLOBAL_LISTNER_NAME {
+
+		// TODO(gu0keno0): better handling of initialization, maybe we just start with RDS directly.
+		if proxy.rdsInitialized {
+			log.Printf("RDS initial request sent already, not going to send further RDS requests for LDS response.")
+			continue
+		}
+
+		if strings.HasSuffix(listener.Name, GLOBAL_LISTNER_NAME_SUFFIX) {
 			log.Printf("Got global listener: %v", listener)
-			rds_config_names := []string{}
 			for _, chain := range listener.FilterChains {
 				for _, filter := range chain.Filters {
 					if filter.Name != wellknown.HTTPConnectionManager {
@@ -178,21 +189,30 @@ func (proxy *XdsProxy) handleLds(resp *envoy_service_discovery_v3.DeltaDiscovery
 					}
 				}
 			}
-			log.Printf("Got RDS config names: %v from %v", rds_config_names, GLOBAL_LISTNER_NAME)
-			// Send RDS request.
-			req := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
-				Node:                   proxy.config.AdsClientConfig.Node(),
-				TypeUrl:                xds_resource.RouteType,
-				ResourceNamesSubscribe: rds_config_names,
-			}
-			// TODO(gu0keno0): handle ratelimit errors.
-			proxy.adsAsyncClient.Send(req)
+			log.Printf("Got RDS config names: %v from %v", rds_config_names, listener.Name)
 		}
 	}
+
+	// TODO(gu0keno0): better handling RDS initialization, using local file cache to reduce bootstrap overhead.
+    if !proxy.rdsInitialized {
+        // Send RDS request.
+        req := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
+            Node:                   proxy.config.AdsClientConfig.Node(),
+            TypeUrl:                xds_resource.RouteType,
+            ResourceNamesSubscribe: rds_config_names,
+        }
+        // TODO(gu0keno0): handle ratelimit errors.
+        proxy.adsAsyncClient.Send(req)
+        proxy.rdsInitialized = true
+    } else {
+        log.Printf("RDS initial request sent already, not going to send further RDS requests for LDS response.")
+    }
+
 	return nil
 }
 
 func (proxy *XdsProxy) handleRds(resp *envoy_service_discovery_v3.DeltaDiscoveryResponse) error {
+	cluster_names := []string{}
 	for _, res := range resp.Resources {
 		route_config := &envoy_config_route_v3.RouteConfiguration{}
 		if err := ptypes.UnmarshalAny(res.Resource, route_config); err != nil {
@@ -209,7 +229,7 @@ func (proxy *XdsProxy) handleRds(resp *envoy_service_discovery_v3.DeltaDiscovery
 			clusters := make(map[string]bool)
 			log.Printf("Got global virtual host: %v", vh)
 			for _, route := range vh.Routes {
-				log.Printf("Got route %v (under %v): %v", route.Name, vh.Name, route)
+				log.Printf("Got route entry %v (under global virtual host %v): %v", route.Name, vh.Name, route)
 				route_action_wrapper, ok := route.Action.(*envoy_config_route_v3.Route_Route)
 				if !ok {
 					return fmt.Errorf("unsupported route action: %v", route.Action)
@@ -220,21 +240,28 @@ func (proxy *XdsProxy) handleRds(resp *envoy_service_discovery_v3.DeltaDiscovery
 				}
 				clusters[cluster.Cluster] = true
 			}
-			log.Printf("Got clusters %v, sending CDS", clusters)
-			cluster_names := []string{}
+
 			for cn, _ := range clusters {
 				cluster_names = append(cluster_names, cn)
 			}
-			req := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
-				Node:                   proxy.config.AdsClientConfig.Node(),
-				TypeUrl:                xds_resource.ClusterType,
-				ResourceNamesSubscribe: cluster_names,
-			}
-			proxy.adsAsyncClient.Send(req)
-			return nil
 		}
 	}
-	return errors.New("cannot find matching routes")
+
+    // TODO(gu0keno0): better handling of CDS initialization by constructing initial CDS request from local file cache.
+	if proxy.cdsInitialized {
+        log.Printf("CDS initial request sent already, not going to send further CDS requests for RDS response.")
+		return nil
+	}
+
+    req := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
+		Node:                   proxy.config.AdsClientConfig.Node(),
+        TypeUrl:                xds_resource.ClusterType,
+        ResourceNamesSubscribe: cluster_names,
+    }
+    proxy.adsAsyncClient.Send(req)
+    proxy.cdsInitialized = true
+
+	return nil
 }
 
 func (proxy *XdsProxy) handleCds(resp *envoy_service_discovery_v3.DeltaDiscoveryResponse) error {
@@ -257,6 +284,13 @@ func (proxy *XdsProxy) handleCds(resp *envoy_service_discovery_v3.DeltaDiscovery
 					}
 				}
 			}
+
+			// TODO(gu0keno0): better handling of EDS initialization.
+			if _, ok := proxy.edsInitialized[cluster.Name]; ok {
+				log.Printf("EDS initial request was already sent for cluster %v, not going to resend EDS request for CDS response.", cluster.Name)
+				continue
+			}
+
 			log.Printf("Got EDS configs: %v\n", eds_config_names)
 			req := &envoy_service_discovery_v3.DeltaDiscoveryRequest{
 				Node:                   proxy.config.AdsClientConfig.Node(),
@@ -264,6 +298,7 @@ func (proxy *XdsProxy) handleCds(resp *envoy_service_discovery_v3.DeltaDiscovery
 				ResourceNamesSubscribe: eds_config_names,
 			}
 			proxy.adsAsyncClient.Send(req)
+			proxy.edsInitialized[cluster.Name] = struct{}{}
 		}
 	}
 	return nil

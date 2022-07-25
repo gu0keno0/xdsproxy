@@ -19,4 +19,5 @@ type ServerConfig struct {
 type ProxyConfig struct {
 	XdsServerConfig *ServerConfig
 	AdsClientConfig *client.AdsClientConfig
+	InitialListeners []string
 }
