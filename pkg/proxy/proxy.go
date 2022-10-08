@@ -32,8 +32,10 @@ import (
 
 const (
 	GLOBAL_LISTNER_NAME_SUFFIX		= "_18080"
+	GLOBAL_LISTNER_NAME_ENVOY_SUFFIX      = "_18081"
+	GLOBAL_LISTNER_NAME_GRPC_SUFFIX = ":18080"
 	GLOBAL_VIRTUAL_HOST_NAME_SUFFIX = ":18080"
-	CLUSTER_NAME_SUFFIX             = ".com"
+	GLOBAL_VIRTUAL_HOST_NAME_ENVOY_SUFFIX = ":18081"
 )
 
 // XdsProxy implements a xDS proxy for upstream Istio cluster with caching
@@ -172,23 +174,37 @@ func (proxy *XdsProxy) handleLds(resp *envoy_service_discovery_v3.DeltaDiscovery
 			continue
 		}
 
-		if strings.HasSuffix(listener.Name, GLOBAL_LISTNER_NAME_SUFFIX) {
+		if strings.HasSuffix(listener.Name, GLOBAL_LISTNER_NAME_SUFFIX) || strings.HasSuffix(listener.Name, GLOBAL_LISTNER_NAME_ENVOY_SUFFIX) || strings.HasSuffix(listener.Name, GLOBAL_LISTNER_NAME_GRPC_SUFFIX) {
 			log.Printf("Got global listener: %v", listener)
-			for _, chain := range listener.FilterChains {
-				for _, filter := range chain.Filters {
-					if filter.Name != wellknown.HTTPConnectionManager {
-						continue
-					}
-					config := xds_resource.GetHTTPConnectionManager(filter)
-					if config == nil {
-						continue
-					}
-					rds, ok := config.RouteSpecifier.(*envoy_extensions_filters_network_http_connection_manager_v3.HttpConnectionManager_Rds)
-					if ok && rds != nil && rds.Rds != nil {
-						rds_config_names = append(rds_config_names, rds.Rds.RouteConfigName)
+
+			if listener.ApiListener != nil {
+				hcm := &envoy_extensions_filters_network_http_connection_manager_v3.HttpConnectionManager{}
+				if err := ptypes.UnmarshalAny(listener.ApiListener.ApiListener, hcm); err != nil {
+					log.Printf("Cannot get HttpConnectionManager from gRPC listener %v: %v\n", listener.Name, err)
+				}
+				rds, ok := hcm.RouteSpecifier.(*envoy_extensions_filters_network_http_connection_manager_v3.HttpConnectionManager_Rds)
+				if ok && rds != nil && rds.Rds != nil {
+					rds_config_names = append(rds_config_names, rds.Rds.RouteConfigName)
+				} else {
+					log.Printf("Cannot get RDS config from gRPC HttpConnectionManager: %v\n", hcm)
+				}
+			} else {
+				for _, chain := range listener.FilterChains {
+					for _, filter := range chain.Filters {
+						if filter.Name != wellknown.HTTPConnectionManager {
+							continue
+						}
+						config := xds_resource.GetHTTPConnectionManager(filter)
+						if config == nil {
+							continue
+						}
+						rds, ok := config.RouteSpecifier.(*envoy_extensions_filters_network_http_connection_manager_v3.HttpConnectionManager_Rds)
+						if ok && rds != nil && rds.Rds != nil {
+							rds_config_names = append(rds_config_names, rds.Rds.RouteConfigName)
+						}
 					}
 				}
-			}
+		    }
 			log.Printf("Got RDS config names: %v from %v", rds_config_names, listener.Name)
 		}
 	}
@@ -223,7 +239,8 @@ func (proxy *XdsProxy) handleRds(resp *envoy_service_discovery_v3.DeltaDiscovery
 		// TODO(gu0keno0): use resource version to avoid duplicated RDS updates.
 		proxy.cache.SetResource(xds_resource.RouteType, route_config.Name, route_config)
 		for _, vh := range route_config.VirtualHosts {
-			if !strings.HasSuffix(vh.Name, GLOBAL_VIRTUAL_HOST_NAME_SUFFIX) {
+			if !(strings.HasSuffix(vh.Name, GLOBAL_VIRTUAL_HOST_NAME_SUFFIX) || strings.HasSuffix(vh.Name, GLOBAL_VIRTUAL_HOST_NAME_ENVOY_SUFFIX)){
+				log.Printf("Skipping virtual host %v.", vh.Name)
 				continue
 			}
 			clusters := make(map[string]bool)
@@ -272,7 +289,7 @@ func (proxy *XdsProxy) handleCds(resp *envoy_service_discovery_v3.DeltaDiscovery
 			return err
 		}
 		// TODO(gu0keno0): better filtering of cluster names.
-		if strings.HasPrefix(cluster.Name, "outbound") && !strings.HasPrefix(cluster.Name, "outbound|18080") && strings.HasSuffix(cluster.Name, CLUSTER_NAME_SUFFIX) {
+		if strings.HasPrefix(cluster.Name, "outbound") && !strings.HasPrefix(cluster.Name, "outbound|18080") {
 			log.Printf("Got cluster: %v", cluster)
 			// TODO(gu0keno0): use resource version to avoid duplicated CDS updates.
 			proxy.cache.SetResource(xds_resource.ClusterType, cluster.Name, cluster)

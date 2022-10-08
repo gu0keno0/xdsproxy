@@ -13,3 +13,6 @@ Run agent in proxy mode:
 Set initial LDS resource name:
 echo > /tmp/1 ; ~/tmp/xdsproxy-agent -c -u 127.0.0.1:15010 -t "d2-service-envoy-benchmark.prod.linkedin.com_18080" 2>&1 | tee /tmp/1
 echo > /tmp/1 ; ~/tmp/xdsproxy-agent -c -u 127.0.0.1:15010 -t "d2-service-polarisfoo1.prod.linkedin.com_18080,d2-service-envoy-benchmark.prod.linkedin.com_18080" 2>&1 | tee /tmp/1
+
+Benchmark Control Plane by specifying concurrency via -p:
+~/tmp/xdsproxy-agent -c -u 127.0.0.1:15010 -t "indis-service-2300.prod.linkedin.com:18080" -g -p 1000
